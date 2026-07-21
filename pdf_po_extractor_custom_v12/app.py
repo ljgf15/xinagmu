@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import shutil
 import tempfile
 from datetime import datetime
@@ -26,8 +28,12 @@ from extractor import (
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
-MAX_FILE_COUNT = 30
-MAX_UPLOAD_SIZE = 25 * 1024 * 1024  # 25 MB / file
+MAX_FILE_COUNT = int(os.getenv("MAX_FILE_COUNT", "500"))
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE_MB", "25")) * 1024 * 1024
+MAX_TOTAL_UPLOAD_SIZE = int(os.getenv("MAX_TOTAL_UPLOAD_SIZE_MB", "5120")) * 1024 * 1024
+UPLOAD_CHUNK_SIZE = int(os.getenv("UPLOAD_CHUNK_SIZE_MB", "1")) * 1024 * 1024
+PARSE_CONCURRENCY = max(1, int(os.getenv("PARSE_CONCURRENCY", str(min(4, os.cpu_count() or 1)))))
+PREVIEW_ROW_LIMIT = int(os.getenv("PREVIEW_ROW_LIMIT", "500"))
 MAX_CUSTOM_FIELDS = 60
 MAX_EXPORT_COLUMNS = 80
 
@@ -195,56 +201,113 @@ def parse_export_columns(
 
 
 async def save_uploads(files: List[UploadFile]):
+    """流式保存上传文件，避免一次上传数百个 PDF 时占满内存。"""
     temp_dir = Path(tempfile.mkdtemp(prefix="pdf_excel_"))
     pdf_paths: List[Path] = []
     errors: List[Dict[str, str]] = []
+    total_size = 0
 
-    for index, file in enumerate(files[:MAX_FILE_COUNT], start=1):
+    accepted_files = files[:MAX_FILE_COUNT]
+    for index, file in enumerate(accepted_files, start=1):
         original_name = Path(file.filename or "upload.pdf").name
         if not original_name.lower().endswith(".pdf"):
             errors.append({"file": original_name, "error": "已跳过：仅支持 PDF 文件。"})
+            await file.close()
             continue
 
-        content = await file.read()
-        if len(content) > MAX_UPLOAD_SIZE:
-            errors.append({"file": original_name, "error": "已跳过：文件超过 25MB。"})
-            continue
-        if not content.startswith(b"%PDF"):
-            errors.append({"file": original_name, "error": "已跳过：文件内容不是有效 PDF。"})
-            continue
-
-        safe_name = f"{index:03d}_{original_name}"
+        safe_name = f"{index:04d}_{original_name}"
         target = temp_dir / safe_name
-        target.write_bytes(content)
-        pdf_paths.append(target)
+        file_size = 0
+        header = b""
+
+        try:
+            with target.open("wb") as output:
+                while True:
+                    chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    if not header:
+                        header = chunk[:4]
+                    file_size += len(chunk)
+                    total_size += len(chunk)
+
+                    if file_size > MAX_UPLOAD_SIZE:
+                        raise ValueError(f"文件超过 {MAX_UPLOAD_SIZE // 1024 // 1024}MB。")
+                    if total_size > MAX_TOTAL_UPLOAD_SIZE:
+                        raise OverflowError(
+                            f"本次上传总大小超过 {MAX_TOTAL_UPLOAD_SIZE // 1024 // 1024}MB。"
+                        )
+                    output.write(chunk)
+
+            if header != b"%PDF":
+                target.unlink(missing_ok=True)
+                errors.append({"file": original_name, "error": "已跳过：文件内容不是有效 PDF。"})
+                continue
+
+            pdf_paths.append(target)
+        except ValueError as exc:
+            target.unlink(missing_ok=True)
+            errors.append({"file": original_name, "error": f"已跳过：{exc}"})
+        except OverflowError:
+            target.unlink(missing_ok=True)
+            errors.append({
+                "file": "全部文件",
+                "error": f"本次上传总大小超过 {MAX_TOTAL_UPLOAD_SIZE // 1024 // 1024}MB，后续文件已停止接收。",
+            })
+            break
+        finally:
+            await file.close()
 
     if len(files) > MAX_FILE_COUNT:
-        errors.append({"file": "全部文件", "error": f"一次最多处理 {MAX_FILE_COUNT} 个 PDF，其余已跳过。"})
+        errors.append({
+            "file": "全部文件",
+            "error": f"一次最多处理 {MAX_FILE_COUNT} 个 PDF，其余 {len(files) - MAX_FILE_COUNT} 个已跳过。",
+        })
 
     return temp_dir, pdf_paths, errors
 
 
 async def parse_all_files(pdf_paths: Sequence[Path], custom_fields: Sequence[Dict[str, Any]]):
+    """有限并发解析 PDF，提升数百文件批处理速度，同时防止 CPU/内存过载。"""
+    semaphore = asyncio.Semaphore(PARSE_CONCURRENCY)
+
+    async def parse_one(file_index: int, pdf_path: Path):
+        display_name = (
+            pdf_path.name[5:]
+            if len(pdf_path.name) > 5 and pdf_path.name[:4].isdigit() and pdf_path.name[4] == "_"
+            else pdf_path.name
+        )
+        async with semaphore:
+            try:
+                rows = await run_in_threadpool(parse_pdf, pdf_path)
+                for row in rows:
+                    row["来源文件"] = display_name
+                    row["_source_file"] = display_name
+                if custom_fields:
+                    rows = await run_in_threadpool(apply_custom_fields, rows, custom_fields)
+                if not rows:
+                    return file_index, [], {
+                        "file": display_name,
+                        "error": "未提取到数据。请确认 PDF 是文字型，且属于当前采购订单格式。",
+                    }
+                return file_index, rows, None
+            except Exception as exc:
+                return file_index, [], {
+                    "file": display_name,
+                    "error": f"解析失败：{type(exc).__name__}。请确认 PDF 是文字型或降低解析并发后重试。",
+                }
+
+    results = await asyncio.gather(
+        *(parse_one(index, path) for index, path in enumerate(pdf_paths))
+    )
+    results.sort(key=lambda item: item[0])
+
     all_rows: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
-
-    for pdf_path in pdf_paths:
-        display_name = pdf_path.name[4:] if len(pdf_path.name) > 4 and pdf_path.name[:3].isdigit() else pdf_path.name
-        try:
-            rows = await run_in_threadpool(parse_pdf, pdf_path)
-            # 把保存时加的序号去掉，Excel 里显示用户原始文件名。
-            for row in rows:
-                row["来源文件"] = display_name
-                row["_source_file"] = display_name
-            if custom_fields:
-                rows = await run_in_threadpool(apply_custom_fields, rows, custom_fields)
-            if not rows:
-                errors.append({"file": display_name, "error": "未提取到数据。请确认 PDF 是文字型，且属于当前采购订单格式。"})
-            else:
-                all_rows.extend(rows)
-        except Exception:
-            errors.append({"file": display_name, "error": "解析失败。请确认 PDF 是文字型，或减少单次上传数量后重试。"})
-
+    for _, rows, error in results:
+        all_rows.extend(rows)
+        if error:
+            errors.append(error)
     return all_rows, errors
 
 
@@ -293,7 +356,7 @@ def custom_hit_summary(rows: Sequence[Dict[str, Any]], export_defs: Sequence[Dic
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "max_file_count": MAX_FILE_COUNT, "parse_concurrency": PARSE_CONCURRENCY}
 
 
 @app.get("/api/columns")
@@ -309,6 +372,8 @@ def columns():
         "Sales order ref",
         "Sales order ref num",
         "Sales order ref item",
+        "包装描述",
+        "催货标识",
         "DIM_CAR_BOX_INNER_LENGTH",
         "DIM_CAR_BOX_INNER_WIDTH",
         "DIM_CAR_BOX_INNER_HEIGHT",
@@ -357,13 +422,13 @@ async def preview(
         return {
             "columns": display_columns(export_defs),
             "export_columns": export_defs,
-            "rows": preview_rows[:500],
+            "rows": preview_rows[:PREVIEW_ROW_LIMIT],
             "errors": errors,
             "custom_fields": custom_hit_summary(rows, export_defs, custom_rules),
             "summary": {
                 "file_count": len(pdf_paths),
                 "row_count": len(preview_rows),
-                "shown_row_count": min(len(preview_rows), 500),
+                "shown_row_count": min(len(preview_rows), PREVIEW_ROW_LIMIT),
                 "error_count": len(errors),
             },
         }
