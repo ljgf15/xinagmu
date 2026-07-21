@@ -1,62 +1,23 @@
-# 采购订单 PDF 提取到 Excel - v12 用户体验优化版
+# 数百 PDF 批量识别版本
 
-本项目是一个可部署到 Render 的网页工具，用于将 KONE、巨人通力、天吴等采购订单 PDF 批量提取为 Excel。
+主要改动：
+- 默认单次最多 500 个 PDF，可通过环境变量 `MAX_FILE_COUNT` 调整。
+- 上传采用分块流式写盘，不再把所有文件一次性读入内存。
+- PDF 使用有限并发解析，默认并发数为 `min(4, CPU 核心数)`。
+- 前端只展示前 20 个文件，避免选择数百文件后页面卡顿。
+- 默认单文件限制 25MB，总上传限制 5120MB，可用环境变量调整。
 
-## v12 重点改动
+可配置环境变量：
+- `MAX_FILE_COUNT=500`
+- `MAX_UPLOAD_SIZE_MB=25`
+- `MAX_TOTAL_UPLOAD_SIZE_MB=5120`
+- `UPLOAD_CHUNK_SIZE_MB=1`
+- `PARSE_CONCURRENCY=4`
+- `PREVIEW_ROW_LIMIT=500`
 
-- 页面重做为更直观的三步式工作台：上传 PDF → 选择字段 → 预览导出。
-- 删除复杂的顶部营销区，改为紧凑专业的业务界面。
-- 系统字段选择改为：字段包 + 分组标签 + 搜索字段。
-- 右侧固定显示 Excel 导出列，可重命名、拖拽排序、删除。
-- 保留自定义查找项，但作为进阶功能，不干扰普通用户。
-- 底层自动拆分 `1PC`、`5.000PCS`、`4 PC` 为数量和单位。
-- 支持配置导入、导出，便于复用字段顺序。
+部署时还需确认反向代理限制，例如 Nginx：
+- `client_max_body_size 5g;`
+- `proxy_read_timeout 3600s;`
+- `proxy_send_timeout 3600s;`
 
-
-## 本次界面调整
-
-- 保留“选择系统字段”区域，并将全部系统字段集中在一个可滚动区域中展示。
-- “预览与导出”和右侧“Excel 导出列”保持固定区域滚动，不撑开原页面布局。
-- 默认导出列和字段包加入“数量原始值”，便于核对 `1PC`、`5.000PCS`、`4 PC` 等原始数量单位写法。
-- 导出 Excel 时继续使用“数量”和“单位”两列拆分数量单位。
-
-
-## v16 补充改动
-
-- 预览与导出区域增加固定高度滚动条，预览数据较多时不再撑开页面。
-- 右侧 Excel 导出列增加固定高度滚动条，字段较多时在列表内部滚动。
-
-## 本地运行
-
-```bash
-pip install -r requirements.txt
-uvicorn app:app --host 0.0.0.0 --port 8000
-```
-
-浏览器打开：
-
-```text
-http://127.0.0.1:8000
-```
-
-## Render 部署
-
-仓库已包含 `render.yaml`，上传到 GitHub 后可直接在 Render 创建 Web Service。
-
-## 使用流程
-
-1. 上传一个或多个采购订单 PDF。
-2. 点击字段包或搜索字段，加入需要的 Excel 导出列。
-3. 右侧调整 Excel 表头和顺序。
-4. 点击“开始预览”，确认后“下载 Excel”。
-## v14 定制字段说明
-
-- “全部系统字段”仅保留：数量原始值、单位、数量、Pos、Material、Price、Amount、Sales order ref、Sales order ref num、Sales order ref item、DIM_CAR_BOX_INNER_LENGTH、DIM_CAR_BOX_INNER_WIDTH、DIM_CAR_BOX_INNER_HEIGHT、长*宽*高。
-- `Sales order ref` 示例 `350912481/6000` 会同时输出：`Sales order ref num = 350912481`、`Sales order ref item = 6000`。
-- `1PC`、`5.000PCS`、`4 PC` 会自动拆分为“数量”和“单位”，并保留“数量原始值”。
-
-## v17 界面滚动优化
-
-- “预览与导出”卡片固定最大高度，统计、错误提示、自定义字段命中提示和预览表格统一在卡片内部滚动。
-- 预览表格保留横向和纵向滚动，避免大量行列把页面撑高。
-- 右侧“Excel 导出列”继续固定高度滚动显示。
+如果服务器内存较小，建议把 `PARSE_CONCURRENCY` 设为 2。
