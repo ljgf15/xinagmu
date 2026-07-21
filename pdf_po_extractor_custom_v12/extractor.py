@@ -31,7 +31,7 @@ ALLOWED_COLUMNS = [
     "Pos", "Material", "Quantity", "Unit", "Price", "Amount", "价格", "金额",
     "Sales order ref", "Sales order ref num", "Sales order ref item", "Sales order no", "Sales order item", "Project ref", "REV", "Shipping instruction",
     "Number of car door entrances", "KCO_RUSH_BUILDING_STATE", "电梯销售地区", "开门方式", "厅门防火等级",
-    "包装箱类型", "轿厢外壳内部高度_AK_mm", "轿厢防护板类型",
+    "包装箱类型", "包装描述", "催货标识", "轿厢外壳内部高度_AK_mm", "轿厢防护板类型",
     "识别号", "图号", "参数及备注", "附加码", "附加信息", "仓库库位", "采购经办人", "审核", "批准",
     "轿厢净开门宽度_LL_mm", "轿门净高_HH_mm", "门尺寸_LL*HH", "高*宽",
     "DIM_CAR_BOX_INNER_LENGTH_mm", "DIM_CAR_BOX_INNER_WIDTH_mm", "DIM_CAR_BOX_INNER_HEIGHT_mm", "长宽高",
@@ -99,6 +99,8 @@ ALIASES.update({
     "品名": "品名规格", "名称规格": "品名规格", "物料描述": "物料名称", "Description": "物料名称", "REV#": "REV", "Shipping Instruction": "Shipping instruction",
     "Car door entrances": "Number of car door entrances", "轿厢外壳内部高度": "轿厢外壳内部高度_AK_mm", "AK": "轿厢外壳内部高度_AK_mm", "防护板类型": "轿厢防护板类型",
     "参数备注": "参数及备注", "备注": "参数及备注", "仓库": "仓库库位", "库位": "仓库库位",
+    "包装箱完整描述": "包装描述", "完整包装描述": "包装描述", "包装规格描述": "包装描述",
+    "3F催货": "催货标识", "是否3F催货": "催货标识", "催货警示": "催货标识",
 })
 
 INTERNAL_KEYS = {"_raw_block", "_raw_text", "_source_file", "_parser", "_page"}
@@ -156,7 +158,9 @@ TABLE_COLUMN_ALIASES.update({
     "料号": "料号", "品名规格": "品名规格", "识别号": "识别号", "参数及备注": "参数及备注", "附加码": "附加码", "附加信息": "附加信息", "仓库库位": "仓库库位",
     "未税单价": "未税单价", "未税金额": "未税总价", "未税总价": "未税总价",
     "REV": "REV", "REV#": "REV", "Shipping instruction": "Shipping instruction", "Number of car door entrances": "Number of car door entrances", "KCO_RUSH_BUILDING_STATE": "KCO_RUSH_BUILDING_STATE",
-    "电梯销售地区": "电梯销售地区", "开门方式": "开门方式", "厅门防火等级": "厅门防火等级", "包装箱类型": "包装箱类型", "轿厢外壳内部高度_AK_mm": "轿厢外壳内部高度_AK_mm", "轿厢防护板类型": "轿厢防护板类型",
+    "电梯销售地区": "电梯销售地区", "开门方式": "开门方式", "厅门防火等级": "厅门防火等级",
+    "包装箱类型": "包装箱类型", "包装描述": "包装描述", "催货标识": "催货标识",
+    "轿厢外壳内部高度_AK_mm": "轿厢外壳内部高度_AK_mm", "轿厢防护板类型": "轿厢防护板类型",
 })
 
 def resolve_table_column_name(name: str) -> str:
@@ -818,6 +822,10 @@ def parse_kone_like_pdf(pdf_path: Path, full_text: str) -> List[Dict[str, Any]]:
     parser_name = "巨人通力采购订单" if is_giant else "KONE采购订单"
     order_fields = extract_common_order_fields(full_text, parser_name)
 
+    # “3F催货”通常出现在订单页眉或催货指令行，属于整张订单级警示。
+    # 一旦识别到，当前订单的每条明细都会携带催货标识，Excel 导出时整行高亮。
+    is_3f_urgent = bool(re.search(r"(?<![A-Z0-9])3\s*F\s*催\s*货", flat, re.I))
+
     rows: List[Dict[str, Any]] = []
     for idx, (line_index, match) in enumerate(starts):
         end_index = starts[idx + 1][0] if idx + 1 < len(starts) else len(lines)
@@ -847,6 +855,9 @@ def parse_kone_like_pdf(pdf_path: Path, full_text: str) -> List[Dict[str, Any]]:
         price_value = clean_number(match.group(6))
         amount_value = clean_number(match.group(7))
 
+        full_packaging_description = extract_complete_packaging_description(block_raw, material_code)
+        material_name = full_packaging_description or extract_kone_material_name(block_raw, material_code)
+
         row = {
             "项目": pos_value,
             "物料": material_code,
@@ -856,8 +867,10 @@ def parse_kone_like_pdf(pdf_path: Path, full_text: str) -> List[Dict[str, Any]]:
             "采购单号": po_no,
             "件号": material_code,
             "料号": material_code,
-            "物料名称": extract_kone_material_name(block_raw, material_code),
-            "品名规格": extract_kone_material_name(block_raw, material_code),
+            "物料名称": material_name,
+            "品名规格": material_name,
+            "包装描述": full_packaging_description,
+            "催货标识": "⚠ 3F催货" if is_3f_urgent else "",
             "物料规格": "",
             "单位": unit,
             "数量": qty,
@@ -1231,6 +1244,49 @@ def extract_kone_description_line(block: str, material_code: str) -> str:
     return ""
 
 
+
+def extract_complete_packaging_description(block: str, material_code: str) -> str:
+    """提取包装明细的完整描述，不丢失箱型、尺寸和中英文附加说明。
+
+    示例：
+    - 4A出口包装箱,3000X950X575 GK英文
+    - 6A出口包装箱,LXWXH 漂白板
+    - 7B 重型瓦楞纸箱,1750X520X300 带垫板
+    """
+    description = extract_kone_description_line(block, material_code)
+    if description:
+        return description
+
+    # 兼容 PDF 把描述与数量拆成多段、或描述紧跟在物料行后面的情况。
+    lines = normalize_lines(block)
+    start = 0
+    for index, line in enumerate(lines):
+        if material_code and material_code in line:
+            start = index + 1
+            break
+
+    stop_labels = (
+        "Sales order ref", "Project ref", "Equipment number", "交付流程", "本台梯的设备号",
+        "销售订单创建日期", "注册商标", "电梯产品类型", "Sold-to party",
+        "Variants condition", "轿厢", "DIM_CAR_BOX", "REV#", "Shipping instruction",
+    )
+    candidates: List[str] = []
+    for line in lines[start:start + 6]:
+        if any(line.startswith(label) for label in stop_labels):
+            break
+        if re.match(r"^\d{1,5}\s+[A-Z0-9]{6,}", line, re.I):
+            break
+        if any(token in line.lower() for token in ["箱", "板", "托盘", "crate", "carton", "case", "package"]):
+            candidates.append(line)
+
+    if candidates:
+        value = " ".join(candidates)
+        value = re.sub(r"\s*/\s*[0-9,]+(?:\.\d+)?\s*[A-Za-z\u4e00-\u9fa5]+\s*$", "", value, flags=re.I)
+        value = re.sub(r"\s+", " ", value).strip(" ：:;，,")
+        return value[:200]
+
+    return ""
+
 def extract_after_label(text: str, label: str) -> str:
     label = str(label or "").strip()
     if not label:
@@ -1408,6 +1464,8 @@ def write_excel(rows: Sequence[Dict[str, Any]], columns: Iterable[Any], output_p
 
     header_fill = PatternFill("solid", fgColor="D9EAF7")
     header_font = Font(bold=True)
+    urgent_fill = PatternFill("solid", fgColor="FFF2CC")
+    urgent_font = Font(color="C00000", bold=True)
     thin = Side(style="thin", color="DDDDDD")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
@@ -1419,11 +1477,18 @@ def write_excel(rows: Sequence[Dict[str, Any]], columns: Iterable[Any], output_p
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
     for row_index, row in enumerate(rows, start=2):
+        is_urgent = bool(str(get_row_value(row, "催货标识") or "").strip())
         for col_index, col in enumerate(column_defs, start=1):
             value = get_row_value(row, col["key"])
             cell = ws.cell(row=row_index, column=col_index, value=value)
             cell.border = border
             cell.alignment = Alignment(vertical="center", wrap_text=True)
+            if is_urgent:
+                # 即使用户没有勾选“催货标识”列，也会对整条明细作醒目警示。
+                cell.fill = urgent_fill
+                cell.font = urgent_font
+        if is_urgent:
+            ws.row_dimensions[row_index].height = 24
 
     ws.freeze_panes = "A2"
     if rows and column_defs:
